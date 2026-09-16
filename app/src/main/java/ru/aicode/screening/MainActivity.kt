@@ -7,15 +7,18 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -49,11 +52,7 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
-data class Evidence(
-    val line: Int,
-    val text: String,
-    val reason: String
-)
+data class Evidence(val line: Int, val text: String, val reason: String)
 
 data class Finding(
     val file: String,
@@ -78,9 +77,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
-                    ScreeningApp()
-                }
+                Surface(modifier = Modifier.fillMaxSize()) { ScreeningApp() }
             }
         }
     }
@@ -98,12 +95,7 @@ class MainActivity : ComponentActivity() {
                         setRequestProperty("Content-Type", "application/json")
                     }
                     connection.outputStream.use { out ->
-                        out.write(
-                            JSONObject()
-                                .put("repository_url", repositoryUrl)
-                                .toString()
-                                .toByteArray()
-                        )
+                        out.write(JSONObject().put("repository_url", repositoryUrl).toString().toByteArray())
                     }
                     if (connection.responseCode !in 200..299) {
                         error("Backend вернул ошибку HTTP ${connection.responseCode}")
@@ -128,25 +120,17 @@ class MainActivity : ComponentActivity() {
                         if (evidenceArray != null) {
                             for (j in 0 until evidenceArray.length()) {
                                 val e = evidenceArray.getJSONObject(j)
-                                add(
-                                    Evidence(
-                                        line = e.optInt("line", 0),
-                                        text = e.optString("text", ""),
-                                        reason = e.optString("reason", "Сигнал требует дополнительной проверки.")
-                                    )
-                                )
+                                add(Evidence(e.optInt("line", 0), e.optString("text", ""), e.optString("reason", "Сигнал требует дополнительной проверки.")))
                             }
                         }
                     }
-                    add(
-                        Finding(
-                            file = item.optString("file", "Unknown file"),
-                            lines = item.optString("lines", "—"),
-                            score = item.optInt("score", 0),
-                            reason = item.optString("reason", "Подозрительные признаки требуют дополнительной проверки."),
-                            evidence = evidence
-                        )
-                    )
+                    add(Finding(
+                        file = item.optString("file", "Unknown file"),
+                        lines = item.optString("lines", "—"),
+                        score = item.optInt("score", 0),
+                        reason = item.optString("reason", "Подозрительные признаки требуют дополнительной проверки."),
+                        evidence = evidence
+                    ))
                 }
             }
         }
@@ -156,12 +140,7 @@ class MainActivity : ComponentActivity() {
                 for (i in 0 until questionArray.length()) add(questionArray.getString(i))
             }
         }
-        return Analysis(
-            repository = root.optString("repository", "GitHub repository"),
-            filesAnalyzed = root.optInt("files_analyzed", 0),
-            findings = findings,
-            questions = questions
-        )
+        return Analysis(root.optString("repository", "GitHub repository"), root.optInt("files_analyzed", 0), findings, questions)
     }
 }
 
@@ -173,6 +152,7 @@ private fun ScreeningApp() {
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var analysis by remember { mutableStateOf<Analysis?>(null) }
+    val listState = rememberLazyListState()
 
     Scaffold(
         topBar = {
@@ -188,13 +168,17 @@ private fun ScreeningApp() {
         }
     ) { innerPadding ->
         LazyColumn(
-            modifier = Modifier.fillMaxSize().padding(innerPadding).padding(horizontal = 16.dp),
+            state = listState,
+            userScrollEnabled = true,
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .padding(horizontal = 16.dp)
+                .navigationBarsPadding(),
+            contentPadding = PaddingValues(top = 4.dp, bottom = 32.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            item {
-                Spacer(Modifier.height(4.dp))
-                HeroCard()
-            }
+            item { HeroCard() }
             item {
                 OutlinedTextField(
                     value = repository,
@@ -217,12 +201,9 @@ private fun ScreeningApp() {
                             analysis = null
                             activity.startAnalysis(url) { result ->
                                 loading = false
-                                result.onSuccess { analysis = it }
-                                    .onFailure { error = it.message ?: "Неизвестная ошибка" }
+                                result.onSuccess { analysis = it }.onFailure { error = it.message ?: "Неизвестная ошибка" }
                             }
-                        } else {
-                            error = "Не удалось получить Android Activity"
-                        }
+                        } else error = "Не удалось получить Android Activity"
                     },
                     enabled = repository.isNotBlank() && !loading,
                     modifier = Modifier.fillMaxWidth(),
@@ -251,10 +232,7 @@ private fun ScreeningApp() {
                 if (result.findings.isEmpty()) {
                     item {
                         Card {
-                            Text(
-                                "Подозрительных участков по текущим эвристикам не найдено. Это не доказывает отсутствие AI-кода — результат является вспомогательным сигналом.",
-                                modifier = Modifier.padding(16.dp)
-                            )
+                            Text("Подозрительных участков по текущим эвристикам не найдено. Это не доказывает отсутствие AI-кода — результат является вспомогательным сигналом.", modifier = Modifier.padding(16.dp))
                         }
                     }
                 } else {
@@ -273,7 +251,6 @@ private fun ScreeningApp() {
                         shape = RoundedCornerShape(14.dp)
                     ) { Text("Проверить другой проект") }
                 }
-                item { Spacer(Modifier.height(12.dp)) }
             }
         }
     }
@@ -281,11 +258,7 @@ private fun ScreeningApp() {
 
 @Composable
 private fun HeroCard() {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(22.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
-    ) {
+    Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
         Column(Modifier.padding(22.dp)) {
             Text("Проверка опыта разработчика", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
@@ -314,10 +287,9 @@ private fun HowItWorksCard() {
 @Composable
 private fun Step(number: String, title: String, description: String) {
     Row(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
-        Box(
-            modifier = Modifier.size(34.dp).background(MaterialTheme.colorScheme.secondaryContainer, RoundedCornerShape(10.dp)),
-            contentAlignment = Alignment.Center
-        ) { Text(number, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold) }
+        Box(Modifier.size(34.dp).background(MaterialTheme.colorScheme.secondaryContainer, RoundedCornerShape(10.dp)), contentAlignment = Alignment.Center) {
+            Text(number, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+        }
         Spacer(Modifier.size(12.dp))
         Column { Text(title, fontWeight = FontWeight.SemiBold); Text(description, style = MaterialTheme.typography.bodySmall) }
     }
@@ -363,7 +335,6 @@ private fun FindingCard(finding: Finding) {
             }
             Spacer(Modifier.height(10.dp))
             Text(finding.reason, style = MaterialTheme.typography.bodyMedium)
-
             if (finding.evidence.isNotEmpty()) {
                 Spacer(Modifier.height(12.dp))
                 Text("Что именно стоит проверить", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
@@ -379,22 +350,11 @@ private fun FindingCard(finding: Finding) {
 
 @Composable
 private fun EvidenceBlock(evidence: Evidence) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
-        shape = RoundedCornerShape(10.dp)
-    ) {
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer), shape = RoundedCornerShape(10.dp)) {
         Column(Modifier.padding(10.dp)) {
             Text("Строка ${evidence.line}", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(4.dp))
-            Text(
-                evidence.text,
-                fontFamily = FontFamily.Monospace,
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(6.dp))
-                    .padding(8.dp)
-            )
+            Text(evidence.text, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall, modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface, RoundedCornerShape(6.dp)).padding(8.dp))
             Spacer(Modifier.height(5.dp))
             Text(evidence.reason, style = MaterialTheme.typography.bodySmall)
         }
