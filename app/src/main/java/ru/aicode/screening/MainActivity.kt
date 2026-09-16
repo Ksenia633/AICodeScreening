@@ -68,7 +68,7 @@ data class Analysis(
     val findings: List<Finding>,
     val questions: List<String>
 ) {
-    val suspicionScore: Int
+    val screeningSignal: Int
         get() = if (findings.isEmpty()) 0 else findings.map { it.score }.average().toInt().coerceIn(0, 100)
 }
 
@@ -128,7 +128,7 @@ class MainActivity : ComponentActivity() {
                         file = item.optString("file", "Unknown file"),
                         lines = item.optString("lines", "—"),
                         score = item.optInt("score", 0),
-                        reason = item.optString("reason", "Подозрительные признаки требуют дополнительной проверки."),
+                        reason = item.optString("reason", "Признаки требуют дополнительной проверки."),
                         evidence = evidence
                     ))
                 }
@@ -228,11 +228,11 @@ private fun ScreeningApp() {
 
             analysis?.let { result ->
                 item { SummaryCard(result) }
-                item { Text("Подозрительные участки", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold) }
+                item { Text("Участки для проверки", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold) }
                 if (result.findings.isEmpty()) {
                     item {
                         Card {
-                            Text("Подозрительных участков по текущим эвристикам не найдено. Это не доказывает отсутствие AI-кода — результат является вспомогательным сигналом.", modifier = Modifier.padding(16.dp))
+                            Text("По текущей модели независимых сигналов не найдено. Повторы UI-компонентов и размер файла сами по себе не считаются признаками AI-кода.", modifier = Modifier.padding(16.dp))
                         }
                     }
                 } else {
@@ -304,12 +304,12 @@ private fun SummaryCard(result: Analysis) {
             Text(result.repository, style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(18.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Metric("Сигнал", "${result.suspicionScore}%")
+                Metric("Сигнал", "${result.screeningSignal}/100")
                 Metric("Файлов", result.filesAnalyzed.toString())
                 Metric("Участков", result.findings.size.toString())
             }
             Spacer(Modifier.height(14.dp))
-            Text("Сигнал объединяет несколько признаков и нужен для выбора мест, которые стоит обсудить на интервью.", style = MaterialTheme.typography.bodySmall)
+            Text("Сигнал — это не вероятность того, что код написан AI. Он объединяет независимые признаки и помогает выбрать места для ручной проверки.", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -329,15 +329,15 @@ private fun FindingCard(finding: Finding) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Column(Modifier.weight(1f)) {
                     Text(finding.file, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text("Подозрительные строки: ${finding.lines}", style = MaterialTheme.typography.labelMedium)
+                    Text("Строки для проверки: ${finding.lines}", style = MaterialTheme.typography.labelMedium)
                 }
-                Text("${finding.score}%", fontWeight = FontWeight.Bold)
+                Text("${finding.score}/100", fontWeight = FontWeight.Bold)
             }
             Spacer(Modifier.height(10.dp))
             Text(finding.reason, style = MaterialTheme.typography.bodyMedium)
             if (finding.evidence.isNotEmpty()) {
                 Spacer(Modifier.height(12.dp))
-                Text("Что именно стоит проверить", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                Text("Почему этот участок попал в проверку", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(6.dp))
                 finding.evidence.forEach { evidence ->
                     EvidenceBlock(evidence)
