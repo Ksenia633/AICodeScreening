@@ -126,15 +126,13 @@ def screen_profile(profile: FileProfile, peers: list[FileProfile]) -> FileAnalys
             line_end=longest[0],
             suspected_text=longest[1].strip()[:500],
             weight=round(min(0.16, style * 0.16), 3),
-            reason="Стиль файла заметно отличается от одноязычных файлов репозитория; это только поддерживающий сигнал.",
+            reason="Стиль файла заметно отличается от одноязычных файлов репозитория; строка показана как опорная точка для ручной проверки, а не как доказательство AI.",
         ))
 
-    # No artificial baseline: 0 means that the detector has not found a concrete signal.
-    # This prevents a misleading 5/100 result when there are no evidence-backed findings.
+    # Every non-zero repository signal must now have an explainable finding.
+    # Style is only a supporting signal and is represented by an explicit finding above.
     evidence_signals = [f.weight for f in findings]
     score = _aggregate(evidence_signals)
-    score += min(0.08, max(0.0, style - 0.50) * 0.16)
-    score = min(1.0, score)
 
     unique = {}
     for finding in findings:
