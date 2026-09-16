@@ -48,12 +48,7 @@ class MainActivity : ComponentActivity() {
                         setRequestProperty("Content-Type", "application/json")
                     }
                     connection.outputStream.use { output ->
-                        output.write(
-                            JSONObject()
-                                .put("repository_url", repositoryUrl)
-                                .toString()
-                                .toByteArray()
-                        )
+                        output.write(JSONObject().put("repository_url", repositoryUrl).toString().toByteArray())
                     }
                     if (connection.responseCode !in 200..299) {
                         val stream = connection.errorStream
@@ -83,13 +78,7 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
-                    add(Finding(
-                        file = item.optString("file", "Unknown file"),
-                        lines = item.optString("lines", "—"),
-                        score = item.optInt("score", 0),
-                        reason = item.optString("reason", "Признаки требуют дополнительной проверки."),
-                        evidence = evidence
-                    ))
+                    add(Finding(item.optString("file", "Unknown file"), item.optString("lines", "—"), item.optInt("score", 0), item.optString("reason", "Признаки требуют дополнительной проверки."), evidence))
                 }
             }
         }
@@ -100,13 +89,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         val signal = root.optInt("screening_signal", findings.maxOfOrNull { it.score } ?: 0)
-        return Analysis(
-            root.optString("repository", "GitHub repository"),
-            root.optInt("files_analyzed", 0),
-            signal.coerceIn(0, 100),
-            findings,
-            questions
-        )
+        return Analysis(root.optString("repository", "GitHub repository"), root.optInt("files_analyzed", 0), signal.coerceIn(0, 100), findings, questions)
     }
 }
 
@@ -119,18 +102,14 @@ private fun ScreeningApp() {
     var error by remember { mutableStateOf<String?>(null) }
     var analysis by remember { mutableStateOf<Analysis?>(null) }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("AI Code Screening", fontWeight = FontWeight.Bold)
-                        Text("Инструмент для HR", style = MaterialTheme.typography.labelSmall)
-                    }
-                }
-            )
-        }
-    ) { innerPadding ->
+    Scaffold(topBar = {
+        TopAppBar(title = {
+            Column {
+                Text("AI Code Screening", fontWeight = FontWeight.Bold)
+                Text("Инструмент для HR", style = MaterialTheme.typography.labelSmall)
+            }
+        })
+    }) { innerPadding ->
         LazyColumn(
             modifier = Modifier.fillMaxSize().padding(innerPadding).padding(horizontal = 16.dp),
             contentPadding = PaddingValues(top = 4.dp, bottom = 32.dp),
@@ -159,12 +138,9 @@ private fun ScreeningApp() {
                             analysis = null
                             activity.startAnalysis(url) { result ->
                                 loading = false
-                                result.onSuccess { analysis = it }
-                                    .onFailure { error = it.message ?: "Неизвестная ошибка" }
+                                result.onSuccess { analysis = it }.onFailure { error = it.message ?: "Неизвестная ошибка" }
                             }
-                        } else {
-                            error = "Не удалось получить Android Activity"
-                        }
+                        } else error = "Не удалось получить Android Activity"
                     },
                     enabled = repository.isNotBlank() && !loading,
                     modifier = Modifier.fillMaxWidth(),
@@ -195,7 +171,7 @@ private fun ScreeningApp() {
                                 if (result.screeningSignal == 0)
                                     "Конкретных evidence-сигналов не найдено. Нормальные повторы UI-компонентов, стиль форматирования и обычная структура кода сами по себе не считаются признаком AI."
                                 else
-                                    "Есть слабый общий сигнал, но для него нет отдельного evidence-участка. Не используйте это число как доказательство AI-кода.",
+                                    "Общий сигнал: ${result.screeningSignal}/100. Это не означает, что найдено ${result.screeningSignal} строк или участков. Текущие правила не нашли отдельного участка, который достаточно обоснован для подсветки HR.",
                                 modifier = Modifier.padding(16.dp)
                             )
                         }
@@ -206,11 +182,9 @@ private fun ScreeningApp() {
                 item { Text("Вопросы для собеседования", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold) }
                 items(result.questions) { question -> QuestionCard(question) }
                 item {
-                    OutlinedButton(
-                        onClick = { analysis = null; error = null },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(14.dp)
-                    ) { Text("Проверить другой проект") }
+                    OutlinedButton(onClick = { analysis = null; error = null }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp)) {
+                        Text("Проверить другой проект")
+                    }
                 }
             }
         }
@@ -271,10 +245,11 @@ private fun SummaryCard(result: Analysis) {
             }
             Spacer(Modifier.height(14.dp))
             Text(
-                if (result.screeningSignal == 0)
-                    "0/100 означает: модель не нашла конкретных evidence-сигналов, которые стоит подсветить HR."
-                else
-                    "Сигнал — не вероятность AI. Каждый ненулевой сигнал должен быть связан с объяснимым участком кода ниже.",
+                when {
+                    result.screeningSignal == 0 -> "Сигнал 0/100: модель не сформировала отдельные evidence-сигналы для проверки."
+                    result.findings.isEmpty() -> "Сигнал ${result.screeningSignal}/100 — это суммарный индикатор по анализу репозитория, а не количество найденных строк. Отдельных участков для подсветки пока нет."
+                    else -> "Сигнал ${result.screeningSignal}/100 — не вероятность AI. Ниже показаны конкретные участки, которые сформировали проверяемые evidence-сигналы."
+                },
                 style = MaterialTheme.typography.bodySmall
             )
         }
