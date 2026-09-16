@@ -191,7 +191,13 @@ private fun ScreeningApp() {
                 if (result.findings.isEmpty()) {
                     item {
                         Card {
-                            Text("По текущей модели сильных независимых сигналов не найдено. Повторы UI-компонентов сами по себе не считаются признаком AI-кода.", modifier = Modifier.padding(16.dp))
+                            Text(
+                                if (result.screeningSignal == 0)
+                                    "Конкретных evidence-сигналов не найдено. Нормальные повторы UI-компонентов, стиль форматирования и обычная структура кода сами по себе не считаются признаком AI."
+                                else
+                                    "Есть слабый общий сигнал, но для него нет отдельного evidence-участка. Не используйте это число как доказательство AI-кода.",
+                                modifier = Modifier.padding(16.dp)
+                            )
                         }
                     }
                 } else {
@@ -264,7 +270,13 @@ private fun SummaryCard(result: Analysis) {
                 Metric("Участков", result.findings.size.toString())
             }
             Spacer(Modifier.height(14.dp))
-            Text("Сигнал — это не вероятность того, что код написан AI. Он объединяет признаки и помогает выбрать места для ручной проверки.", style = MaterialTheme.typography.bodySmall)
+            Text(
+                if (result.screeningSignal == 0)
+                    "0/100 означает: модель не нашла конкретных evidence-сигналов, которые стоит подсветить HR."
+                else
+                    "Сигнал — не вероятность AI. Каждый ненулевой сигнал должен быть связан с объяснимым участком кода ниже.",
+                style = MaterialTheme.typography.bodySmall
+            )
         }
     }
 }
