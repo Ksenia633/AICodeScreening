@@ -41,7 +41,7 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 Открой корень проекта в Android Studio, дождись Gradle Sync и запусти `app` на Android Emulator. Эмулятор обращается к backend компьютера через `http://10.0.2.2:8000`.
 
-Проект настроен на Android Gradle Plugin 8.13.2, Gradle 8.13, Kotlin 2.3.21 и Java 17. Эта связка выбрана для предсказуемой совместимости; AGP 8.13 поддерживает Gradle 8.13 и JDK 17, а AGP 8.13.2 добавляет поддержку Kotlin 2.3. citeturn3search0turn3search2
+Проект настроен на Android Gradle Plugin 8.13.2, Gradle 8.13, Kotlin 2.3.21 и Java 17.
 
 ### Если Android Studio продолжает показывать старую ошибку Gradle
 
