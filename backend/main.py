@@ -10,7 +10,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="AI Code Screening API", version="0.1.0")
+app = FastAPI(title="AI Code Screening API", version="0.2.0")
 
 GITHUB_API = "https://api.github.com"
 SUPPORTED_EXTENSIONS = {
@@ -18,6 +18,7 @@ SUPPORTED_EXTENSIONS = {
     ".cpp", ".c", ".h", ".cs", ".swift", ".dart"
 }
 IGNORED_NAMES = {"build", ".gradle", "node_modules", "vendor", "dist"}
+MAX_FILES = 30
 
 
 class AnalyzeRequest(BaseModel):
@@ -39,19 +40,29 @@ class AnalysisResponse(BaseModel):
 
 
 def parse_repo(url: str) -> tuple[str, str]:
-    parsed = urlparse(url.strip())
-    if parsed.netloc.lower() not in {"github.com", "www.github.com"}:
-        raise ValueError("Нужна ссылка на GitHub repository")
-    parts = [p for p in parsed.path.split("/") if p]
+    value = url.strip()
+    if not value:
+        raise ValueError("Введите ссылку на GitHub repository")
+
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() not in {"github.com", "www.github.com"}:
+        raise ValueError("Нужна ссылка вида https://github.com/owner/repository")
+
+    parts = [part for part in parsed.path.split("/") if part]
     if len(parts) < 2:
         raise ValueError("Ссылка должна иметь вид https://github.com/owner/repository")
-    return parts[0], parts[1].replace(".git", "")
+
+    owner = parts[0]
+    repo = parts[1].removesuffix(".git")
+    if not owner or not repo:
+        raise ValueError("Не удалось определить owner и repository")
+    return owner, repo
 
 
 def headers() -> dict[str, str]:
     result = {
         "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2026-03-10",
+        "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "ai-code-screening-coursework",
     }
     token = os.getenv("GITHUB_TOKEN")
@@ -62,14 +73,25 @@ def headers() -> dict[str, str]:
 
 async def github_get(client: httpx.AsyncClient, path: str) -> Any:
     response = await client.get(f"{GITHUB_API}{path}", headers=headers())
+    if response.status_code == 404:
+        raise HTTPException(
+            status_code=404,
+            detail="Репозиторий не найден. Если он приватный, задайте GITHUB_TOKEN на backend.",
+        )
+    if response.status_code == 403:
+        raise HTTPException(
+            status_code=403,
+            detail="GitHub отклонил запрос. Проверьте GITHUB_TOKEN и лимит GitHub API.",
+        )
     if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=f"GitHub API: {response.text[:300]}")
+        raise HTTPException(status_code=response.status_code, detail=f"GitHub API error: {response.text[:300]}")
     return response.json()
 
 
 def is_source_file(path: str) -> bool:
+    parts = path.lower().split("/")
     return any(path.lower().endswith(ext) for ext in SUPPORTED_EXTENSIONS) and not any(
-        part in IGNORED_NAMES for part in path.split("/")
+        part in IGNORED_NAMES for part in parts
     )
 
 
@@ -80,8 +102,8 @@ def suspicious_signals(code: str) -> tuple[int, list[str]]:
     non_empty = [line for line in lines if line.strip()]
 
     if len(non_empty) > 10:
-        avg_len = sum(len(line) for line in non_empty) / len(non_empty)
-        if avg_len > 105:
+        average_length = sum(len(line) for line in non_empty) / len(non_empty)
+        if average_length > 105:
             score += 18
             reasons.append("высокая средняя длина строк")
 
@@ -93,7 +115,9 @@ def suspicious_signals(code: str) -> tuple[int, list[str]]:
         score += 40
         reasons.append("явные маркеры AI/generated в комментариях")
 
-    generic_comments = len(re.findall(r"//\s*(this|that|the|function|method)\b", code, re.IGNORECASE))
+    generic_comments = len(
+        re.findall(r"//\s*(this|that|the|function|method)\b", code, re.IGNORECASE)
+    )
     if generic_comments >= 3:
         score += 12
         reasons.append("много однотипных общих комментариев")
@@ -102,7 +126,6 @@ def suspicious_signals(code: str) -> tuple[int, list[str]]:
         score += 8
         reasons.append("нет очевидных признаков тестовой проверки")
 
-    # Deliberately conservative: this is a screening signal, not proof of AI authorship.
     score = min(score, 95)
     if not reasons:
         reasons.append("выраженных эвристических признаков не найдено")
@@ -120,8 +143,10 @@ def make_questions(findings: list[Finding]) -> list[str]:
             f"Какие альтернативы решению в {finding.file} вы рассматривали и какие у них компромиссы?"
         )
     if not questions:
-        questions.append("Какой самый сложный участок проекта вы реализовали самостоятельно и почему?")
-        questions.append("Как бы вы изменили архитектуру проекта при росте нагрузки в 10 раз?")
+        questions.extend([
+            "Какой самый сложный участок проекта вы реализовали самостоятельно и почему?",
+            "Как бы вы изменили архитектуру проекта при росте нагрузки в 10 раз?",
+        ])
     return questions[:8]
 
 
@@ -137,9 +162,17 @@ async def analyze(request: AnalyzeRequest) -> AnalysisResponse:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         repo_data = await github_get(client, f"/repos/{owner}/{repo}")
-        tree = await github_get(client, f"/repos/{owner}/{repo}/git/trees/{repo_data['default_branch']}?recursive=1")
+        default_branch = repo_data.get("default_branch") or "main"
+        tree = await github_get(
+            client,
+            f"/repos/{owner}/{repo}/git/trees/{default_branch}?recursive=1",
+        )
+
+        if tree.get("truncated"):
+            # GitHub can truncate very large trees; we still analyze the returned files.
+            pass
 
         findings: list[Finding] = []
         files_analyzed = 0
@@ -147,13 +180,15 @@ async def analyze(request: AnalyzeRequest) -> AnalysisResponse:
             path = item.get("path", "")
             if item.get("type") != "blob" or not is_source_file(path):
                 continue
-            if files_analyzed >= 30:
+            if files_analyzed >= MAX_FILES:
                 break
+
             files_analyzed += 1
             blob = await github_get(client, f"/repos/{owner}/{repo}/git/blobs/{item['sha']}")
             try:
-                code = base64.b64decode(blob.get("content", "")).decode("utf-8", errors="ignore")
-            except Exception:
+                encoded = blob.get("content", "")
+                code = base64.b64decode(encoded).decode("utf-8", errors="ignore")
+            except (ValueError, TypeError):
                 continue
 
             score, reasons = suspicious_signals(code)
@@ -169,12 +204,10 @@ async def analyze(request: AnalyzeRequest) -> AnalysisResponse:
                     )
                 )
 
-    findings.sort(key=lambda x: x.score, reverse=True)
-    questions = make_questions(findings)
-    full_name = repo_data.get("full_name", f"{owner}/{repo}")
+    findings.sort(key=lambda item: item.score, reverse=True)
     return AnalysisResponse(
-        repository=full_name,
+        repository=repo_data.get("full_name", f"{owner}/{repo}"),
         files_analyzed=files_analyzed,
         findings=findings,
-        questions=questions,
+        questions=make_questions(findings),
     )
