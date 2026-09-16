@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import statistics
-from collections import Counter
 
 from detector import FileAnalysisResult, FileProfile, Finding, provenance_findings_from_profile
 
@@ -66,7 +65,6 @@ def _structural_repetition(profile: FileProfile) -> tuple[float, list[dict]]:
     if not groups:
         return 0.0, []
     group = max(groups, key=len)
-    # Repetition is deliberately weak: repeated UI code is normal.
     return min(1.0, max(0.0, (len(group) - 2) / 5)), group
 
 
@@ -88,7 +86,6 @@ def screen_profile(profile: FileProfile, peers: list[FileProfile]) -> FileAnalys
     regularity = _line_regularity(profile.code)
     identifier_style = _identifier_regularity(profile.code)
 
-    # Normal UI repetition is not an AI signal.
     ui_functions = sum(1 for f in (profile.ast or {}).get("functions", []) if f.get("is_ui"))
     total_functions = max(1, len((profile.ast or {}).get("functions", [])))
     ui_ratio = ui_functions / total_functions
@@ -118,7 +115,6 @@ def screen_profile(profile: FileProfile, peers: list[FileProfile]) -> FileAnalys
                 reason="Несколько нетипичных функций имеют близкий AST-скелет после исключения имён и литералов.",
             ))
 
-    # Stylometry is supporting evidence only and cannot dominate the result.
     style = 0.40 * regularity + 0.20 * identifier_style + 0.40 * outlier
     if ui_ratio >= 0.50:
         style *= 0.35
@@ -133,10 +129,10 @@ def screen_profile(profile: FileProfile, peers: list[FileProfile]) -> FileAnalys
             reason="Стиль файла заметно отличается от одноязычных файлов репозитория; это только поддерживающий сигнал.",
         ))
 
-    # A continuous neutral baseline avoids misleading 0/100 results.
-    baseline = 0.05 if profile.non_empty_lines >= 20 else 0.02
+    # No artificial baseline: 0 means that the detector has not found a concrete signal.
+    # This prevents a misleading 5/100 result when there are no evidence-backed findings.
     evidence_signals = [f.weight for f in findings]
-    score = baseline + (1.0 - baseline) * _aggregate(evidence_signals)
+    score = _aggregate(evidence_signals)
     score += min(0.08, max(0.0, style - 0.50) * 0.16)
     score = min(1.0, score)
 
@@ -157,7 +153,6 @@ def screen_profile(profile: FileProfile, peers: list[FileProfile]) -> FileAnalys
 def repository_signal(results: list[FileAnalysisResult]) -> float:
     if not results:
         return 0.0
-    # Weight larger source files slightly more, but do not let one file dominate.
     values = sorted((r.total_score for r in results), reverse=True)
     top = values[: min(8, len(values))]
     weights = [1.0 / math.log2(i + 2) for i in range(len(top))]
