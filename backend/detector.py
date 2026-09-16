@@ -9,7 +9,7 @@ from typing import Any
 try:
     from tree_sitter import Parser
     from tree_sitter_language_pack import get_language
-except ImportError:  # Backend still starts, but AST mode is disabled until dependencies are installed.
+except ImportError:
     Parser = None
     get_language = None
 
@@ -73,16 +73,33 @@ def function_pattern(language: str) -> re.Pattern[str]:
     return re.compile(r"^\s*(?:def|func|function)\s+[A-Za-z_]\w*\s*\(")
 
 
-def walk(root: Any):
-    stack = [root]
-    while stack:
-        node = stack.pop()
-        yield node
-        stack.extend(reversed(node.children))
+def _node_depth(node: Any, limit: int = 2000) -> int:
+    max_depth = 0
+    stack = [(node, 0)]
+    visited = 0
+    while stack and visited < limit:
+        current, depth = stack.pop()
+        visited += 1
+        max_depth = max(max_depth, depth)
+        stack.extend((child, depth + 1) for child in reversed(current.children))
+    return max_depth
+
+
+def _descendant_count(node: Any, wanted: set[str], limit: int = 4000) -> int:
+    count = 0
+    stack = [node]
+    visited = 0
+    while stack and visited < limit:
+        current = stack.pop()
+        visited += 1
+        if current.type in wanted:
+            count += 1
+        stack.extend(reversed(current.children))
+    return count
 
 
 def dart_ast_metrics(code: str) -> dict[str, Any] | None:
-    """Extract structural Dart/Flutter features with a real syntax tree."""
+    """Extract function-local Dart structure; normal repeated Flutter widgets are ignored."""
     if Parser is None or get_language is None:
         return None
     try:
@@ -105,23 +122,23 @@ def dart_ast_metrics(code: str) -> dict[str, Any] | None:
     }
 
     functions: list[dict[str, int]] = []
-    branch_count = 0
-    max_depth = 0
     widget_constructors = 0
     parse_errors = 0
-
-    stack: list[tuple[Any, int]] = [(root, 0)]
+    stack = [root]
     while stack:
-        node, depth = stack.pop()
-        max_depth = max(max_depth, depth)
+        node = stack.pop()
         if node.type == "ERROR":
             parse_errors += 1
-        if node.type in branch_types:
-            branch_count += 1
         if node.type in function_types:
             start_line = node.start_point[0] + 1
             end_line = node.end_point[0] + 1
-            functions.append({"line": start_line, "end_line": end_line, "length": max(1, end_line - start_line + 1)})
+            functions.append({
+                "line": start_line,
+                "end_line": end_line,
+                "length": max(1, end_line - start_line + 1),
+                "depth": _node_depth(node),
+                "branches": _descendant_count(node, branch_types),
+            })
         if node.type == "constructor_invocation":
             try:
                 text = source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
@@ -130,14 +147,13 @@ def dart_ast_metrics(code: str) -> dict[str, Any] | None:
                     widget_constructors += 1
             except Exception:
                 pass
-        for child in reversed(node.children):
-            stack.append((child, depth + 1))
+        stack.extend(reversed(node.children))
 
     return {
         "functions": functions,
         "long_functions": [f for f in functions if f["length"] >= 45],
-        "branch_count": branch_count,
-        "max_depth": max_depth,
+        "branch_count": sum(f["branches"] for f in functions),
+        "max_depth": max((f["depth"] for f in functions), default=0),
         "widget_constructors": widget_constructors,
         "parse_errors": parse_errors,
     }
@@ -171,11 +187,34 @@ def build_profile(path: str, code: str) -> FileProfile:
     )
 
 
-def evidence_for_code(profile: FileProfile, repo_profiles: list[FileProfile]) -> FindingData | None:
-    """Find combinations that deserve human review.
+def _normalise_function_body(lines: list[str]) -> str:
+    """Remove identifiers/literals so only unusually identical function skeletons remain."""
+    text = "\n".join(lines)
+    text = re.sub(r"//.*", "", text)
+    text = re.sub(r"(['\"])(?:\\.|(?!\1).)*\1", "STR", text)
+    text = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", "ID", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-    Repeated UI constructs are intentionally ignored. AST complexity is contextual evidence,
-    never a standalone AI verdict.
+
+def _function_blocks(profile: FileProfile) -> list[tuple[int, int, str]]:
+    if not profile.ast:
+        return []
+    blocks = []
+    lines = profile.code.splitlines()
+    for fn in profile.ast["functions"]:
+        start = max(1, fn["line"])
+        end = min(len(lines), fn["end_line"])
+        if end - start + 1 >= 8:
+            blocks.append((start, end, _normalise_function_body(lines[start - 1:end])))
+    return blocks
+
+
+def evidence_for_code(profile: FileProfile, repo_profiles: list[FileProfile]) -> FindingData | None:
+    """Return only multi-signal evidence that is worth discussing with a candidate.
+
+    Repeated InputDecoration/Container/Text/Row/Column and similar UI constructs are
+    explicitly not treated as AI evidence. No score here is a calibrated probability.
     """
     lines = profile.code.splitlines()
     non_empty = [(i + 1, line) for i, line in enumerate(lines) if line.strip()]
@@ -190,19 +229,19 @@ def evidence_for_code(profile: FileProfile, repo_profiles: list[FileProfile]) ->
         if reason not in reasons:
             reasons.append(reason)
 
-    # Strong provenance markers. These are the only single-line signals allowed to be strong.
+    # Explicit provenance is strong, but still displayed as evidence rather than proof.
     ai_marker = re.compile(r"generated\s+by|chatgpt|copilot|github\s+copilot|ai[- ]generated|openai|gemini|claude", re.I)
     for line_no, line in non_empty:
         if ai_marker.search(line):
             add(line_no, line, 70, "явный маркер AI-инструмента или сгенерированного кода")
 
-    # Weak template phrases: useful only in combination with other independent signals.
+    # Template markers are intentionally weak.
     template_marker = re.compile(r"TODO|FIXME|PLACEHOLDER|IMPLEMENT\s+HERE|YOUR\s+CODE|ADD\s+YOUR", re.I)
     for line_no, line in non_empty:
         if template_marker.search(line):
-            add(line_no, line, 3, "шаблонный маркер незавершённого участка")
+            add(line_no, line, 2, "шаблонный маркер незавершённого участка")
 
-    # Generic explanatory prose is more interesting than normal UI repetition, but still weak.
+    # Polished explanatory comments: weak on their own, stronger when repeated with other signals.
     generic_comment = re.compile(
         r"^\s*(?://|#|/\*|\*)\s*(this (function|method|class|widget|component)|the (function|method|purpose)|returns?\s+the|handles?\s+the|responsible for)",
         re.I,
@@ -211,56 +250,63 @@ def evidence_for_code(profile: FileProfile, repo_profiles: list[FileProfile]) ->
     for line_no, line in non_empty:
         if generic_comment.search(line):
             generic_hits.append((line_no, line))
-            add(line_no, line, 3, "избыточный шаблонный комментарий")
-    if len(generic_hits) >= 4:
-        score += 3
-        reasons.append("много однотипных поясняющих комментариев")
+    if generic_hits:
+        for line_no, line in generic_hits[:4]:
+            add(line_no, line, 2, "избыточный шаблонный комментарий")
+        if len(generic_hits) >= 4:
+            score += 3
+            reasons.append("много однотипных поясняющих комментариев")
 
-    # AST signal for Dart: only the combination of long function + deep nesting + many branches.
-    # Widget constructor count is never suspicious by itself.
     ast = profile.ast
     if ast:
-        if ast["long_functions"] and ast["max_depth"] >= 7 and ast["branch_count"] >= 8:
+        # Function-local, not file-global, complexity avoids false positives from large Flutter trees.
+        suspicious_functions = [
+            fn for fn in ast["functions"]
+            if fn["length"] >= 45 and fn["depth"] >= 8 and fn["branches"] >= 8
+        ]
+        if suspicious_functions:
+            fn = max(suspicious_functions, key=lambda x: (x["branches"], x["length"], x["depth"]))
+            line = lines[fn["line"] - 1] if fn["line"] <= len(lines) else ""
+            add(fn["line"], line, 6, "AST: одна функция одновременно длинная, глубоко вложенная и содержит много ветвлений")
+
+        # A huge widget tree is normal in Flutter, so it is only a tiny contextual signal.
+        if ast["widget_constructors"] >= 35 and ast["long_functions"] and profile.comment_lines >= 6:
             fn = max(ast["long_functions"], key=lambda x: x["length"])
             line = lines[fn["line"] - 1] if fn["line"] <= len(lines) else ""
-            add(fn["line"], line, 6, "AST: длинная функция с глубокой вложенностью и большим числом ветвлений")
-        if ast["widget_constructors"] >= 35 and ast["long_functions"]:
-            fn = max(ast["long_functions"], key=lambda x: x["length"])
-            line = lines[fn["line"] - 1] if fn["line"] <= len(lines) else ""
-            add(fn["line"], line, 3, "AST: очень большой Flutter widget tree внутри длинного метода")
+            add(fn["line"], line, 2, "AST: большой widget tree сочетается с нетипично подробными комментариями")
 
-    # Generic complexity signal for non-Dart and fallback cases.
-    function_re = function_pattern(profile.language)
-    control_re = re.compile(r"\b(if|else|for|while|switch|when|try|catch|match)\b")
-    for line_no, line in non_empty:
-        if function_re.search(line):
-            window = lines[line_no - 1:min(len(lines), line_no + 60)]
-            controls = len(control_re.findall("\n".join(window)))
-            if controls >= 7 and len(window) >= 30:
-                add(line_no, line, 4, "функция длинная и насыщена управляющей логикой")
+    # Repeated function skeletons are considered only outside obvious UI constructors.
+    blocks = _function_blocks(profile)
+    skeletons: dict[str, list[int]] = {}
+    for start, end, skeleton in blocks:
+        if len(skeleton) < 80:
+            continue
+        if re.search(r"InputDecoration|Container|Text|Row|Column|Padding|SizedBox|BorderRadius", skeleton):
+            continue
+        skeletons.setdefault(skeleton, []).append(start)
+    repeated = [starts for starts in skeletons.values() if len(starts) >= 2]
+    if repeated:
+        starts = repeated[0][:3]
+        for line_no in starts:
+            add(line_no, lines[line_no - 1], 2, "одинаковый нетипичный шаблон нескольких функций")
 
-    # Repository-relative style outlier, deliberately low weight.
+    # Repository-relative style outliers are deliberately tiny signals.
     same_language = [p for p in repo_profiles if p.language == profile.language and p.non_empty_lines >= 20]
     if len(same_language) >= 4:
         median_len = statistics.median(p.avg_line_length for p in same_language)
         median_comments = statistics.median(p.comment_lines / max(1, p.non_empty_lines) for p in same_language)
         comment_ratio = profile.comment_lines / max(1, profile.non_empty_lines)
-        if median_len > 0 and profile.avg_line_length > median_len * 1.7:
+        if median_len > 0 and profile.avg_line_length > median_len * 1.8:
             longest = sorted(non_empty, key=lambda x: len(x[1]), reverse=True)[:2]
             for line_no, line in longest:
                 add(line_no, line, 1, "строка заметно выбивается по стилю от файлов того же языка")
-            reasons.append("стиль файла отличается от основной массы файлов репозитория")
         if median_comments == 0 and comment_ratio > 0.20:
-            score += 2
+            score += 1
             reasons.append("необычно высокая доля поясняющих комментариев")
 
-    # Comment-heavy files become relevant only when generic comments are also present.
-    if profile.non_empty_lines >= 80 and profile.comment_lines / profile.non_empty_lines >= 0.28 and len(generic_hits) >= 3:
-        score += 4
-        reasons.append("высокая доля комментариев сочетается с шаблонными пояснениями")
-
-    strong = any(item.reason.startswith("явный маркер") for item in evidence)
+    # Never flag a file merely because it is large, repetitive, or full of UI widgets.
     independent = len(set(reasons))
+    strong = any(item.reason.startswith("явный маркер") for item in evidence)
     if not strong and independent < 2:
         return None
 
