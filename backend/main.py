@@ -10,10 +10,9 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from detector import Evidence as DetectorEvidence
-from detector import evidence_for_code, build_profile
+from detector import FileAnalysisResult, analyze_file, build_profile, evidence_for_code
 
-app = FastAPI(title="AI Code Screening API", version="0.7.0")
+app = FastAPI(title="AI Code Screening API", version="0.8.0")
 
 GITHUB_API = "https://api.github.com"
 SUPPORTED_EXTENSIONS = {
@@ -46,6 +45,7 @@ class Finding(BaseModel):
 class AnalysisResponse(BaseModel):
     repository: str
     files_analyzed: int
+    file_results: list[FileAnalysisResult]
     findings: list[Finding]
     questions: list[str]
 
@@ -146,21 +146,27 @@ async def analyze(request: AnalyzeRequest) -> AnalysisResponse:
 
     profiles = [build_profile(path, code) for path, code in source_files.items()]
     findings: list[Finding] = []
+    file_results: list[FileAnalysisResult] = []
+
     for profile in profiles:
-        finding = evidence_for_code(profile, profiles)
-        if finding is None:
+        result = analyze_file(profile.code, profile.language)
+        result = result.model_copy(update={"file_path": profile.path})
+        file_results.append(result)
+
+        legacy = evidence_for_code(profile, profiles)
+        if legacy is None:
             continue
-        findings.append(
-            Finding(
-                file=finding.file,
-                lines=finding.lines,
-                score=finding.score,
-                reason=finding.reason,
-                evidence=[Evidence(line=e.line, text=e.text, reason=e.reason) for e in finding.evidence],
-            )
-        )
+        findings.append(Finding(
+            file=legacy.file,
+            lines=legacy.lines,
+            score=legacy.score,
+            reason=legacy.reason,
+            evidence=[Evidence(line=e.line, text=e.text, reason=e.reason) for e in legacy.evidence],
+        ))
 
     findings.sort(key=lambda item: item.score, reverse=True)
+    file_results.sort(key=lambda item: item.total_score, reverse=True)
+
     questions: list[str] = []
     for finding in findings[:5]:
         questions.append(f"Объясните своими словами строки {finding.lines} в {finding.file}. Почему выбран именно такой подход?")
@@ -174,6 +180,7 @@ async def analyze(request: AnalyzeRequest) -> AnalysisResponse:
     return AnalysisResponse(
         repository=repo_data.get("full_name", f"{owner}/{repo}"),
         files_analyzed=len(source_files),
+        file_results=file_results,
         findings=findings,
         questions=questions[:8],
     )
