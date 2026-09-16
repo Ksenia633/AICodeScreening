@@ -38,7 +38,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
@@ -49,11 +49,18 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
+data class Evidence(
+    val line: Int,
+    val text: String,
+    val reason: String
+)
+
 data class Finding(
     val file: String,
     val lines: String,
     val score: Int,
-    val reason: String
+    val reason: String,
+    val evidence: List<Evidence>
 )
 
 data class Analysis(
@@ -116,12 +123,28 @@ class MainActivity : ComponentActivity() {
             if (findingArray != null) {
                 for (i in 0 until findingArray.length()) {
                     val item = findingArray.getJSONObject(i)
+                    val evidenceArray = item.optJSONArray("evidence")
+                    val evidence = buildList {
+                        if (evidenceArray != null) {
+                            for (j in 0 until evidenceArray.length()) {
+                                val e = evidenceArray.getJSONObject(j)
+                                add(
+                                    Evidence(
+                                        line = e.optInt("line", 0),
+                                        text = e.optString("text", ""),
+                                        reason = e.optString("reason", "Сигнал требует дополнительной проверки.")
+                                    )
+                                )
+                            }
+                        }
+                    }
                     add(
                         Finding(
                             file = item.optString("file", "Unknown file"),
                             lines = item.optString("lines", "—"),
                             score = item.optInt("score", 0),
-                            reason = item.optString("reason", "Подозрительные признаки требуют дополнительной проверки.")
+                            reason = item.optString("reason", "Подозрительные признаки требуют дополнительной проверки."),
+                            evidence = evidence
                         )
                     )
                 }
@@ -145,7 +168,7 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ScreeningApp() {
-    val activity = LocalContext.current as? MainActivity
+    val activity = androidx.compose.ui.platform.LocalContext.current as? MainActivity
     var repository by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -229,7 +252,7 @@ private fun ScreeningApp() {
                     item {
                         Card {
                             Text(
-                                "Подозрительных участков не найдено. Это не доказывает отсутствие AI-кода — результат является вспомогательным сигналом.",
+                                "Подозрительных участков по текущим эвристикам не найдено. Это не доказывает отсутствие AI-кода — результат является вспомогательным сигналом.",
                                 modifier = Modifier.padding(16.dp)
                             )
                         }
@@ -279,7 +302,7 @@ private fun HowItWorksCard() {
             Spacer(Modifier.height(12.dp))
             Step("01", "GitHub", "Добавьте ссылку на публичный репозиторий")
             Step("02", "Анализ", "Система проверит структуру и исходный код")
-            Step("03", "Скрининг", "Получите участки для проверки и вопросы кандидату")
+            Step("03", "Скрининг", "Получите конкретные строки для проверки и вопросы кандидату")
             Spacer(Modifier.height(10.dp))
             HorizontalDivider()
             Spacer(Modifier.height(10.dp))
@@ -314,7 +337,7 @@ private fun SummaryCard(result: Analysis) {
                 Metric("Участков", result.findings.size.toString())
             }
             Spacer(Modifier.height(14.dp))
-            Text("Сигнал отражает наличие признаков, требующих дополнительной проверки.", style = MaterialTheme.typography.bodySmall)
+            Text("Сигнал объединяет несколько признаков и нужен для выбора мест, которые стоит обсудить на интервью.", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -334,12 +357,46 @@ private fun FindingCard(finding: Finding) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Column(Modifier.weight(1f)) {
                     Text(finding.file, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text("Строки ${finding.lines}", style = MaterialTheme.typography.labelMedium)
+                    Text("Подозрительные строки: ${finding.lines}", style = MaterialTheme.typography.labelMedium)
                 }
                 Text("${finding.score}%", fontWeight = FontWeight.Bold)
             }
             Spacer(Modifier.height(10.dp))
             Text(finding.reason, style = MaterialTheme.typography.bodyMedium)
+
+            if (finding.evidence.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                Text("Что именно стоит проверить", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(6.dp))
+                finding.evidence.forEach { evidence ->
+                    EvidenceBlock(evidence)
+                    Spacer(Modifier.height(8.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EvidenceBlock(evidence: Evidence) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+        shape = RoundedCornerShape(10.dp)
+    ) {
+        Column(Modifier.padding(10.dp)) {
+            Text("Строка ${evidence.line}", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                evidence.text,
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(6.dp))
+                    .padding(8.dp)
+            )
+            Spacer(Modifier.height(5.dp))
+            Text(evidence.reason, style = MaterialTheme.typography.bodySmall)
         }
     }
 }
