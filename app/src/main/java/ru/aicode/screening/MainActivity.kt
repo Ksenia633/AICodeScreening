@@ -48,14 +48,14 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
-private data class Finding(
+data class Finding(
     val file: String,
     val lines: String,
     val score: Int,
     val reason: String
 )
 
-private data class Analysis(
+data class Analysis(
     val repository: String,
     val filesAnalyzed: Int,
     val findings: List<Finding>,
@@ -158,31 +158,22 @@ private fun ScreeningApp() {
                         Text("Инструмент для HR", style = MaterialTheme.typography.labelSmall)
                     }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surface
-                )
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface)
             )
         }
     ) { innerPadding ->
         LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .padding(horizontal = 16.dp),
+            modifier = Modifier.fillMaxSize().padding(innerPadding).padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             item {
                 Spacer(Modifier.height(4.dp))
                 HeroCard()
             }
-
             item {
                 OutlinedTextField(
                     value = repository,
-                    onValueChange = {
-                        repository = it
-                        error = null
-                    },
+                    onValueChange = { repository = it; error = null },
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text("GitHub repository") },
                     placeholder = { Text("https://github.com/owner/project") },
@@ -191,22 +182,21 @@ private fun ScreeningApp() {
                     shape = RoundedCornerShape(14.dp)
                 )
             }
-
             item {
                 Button(
                     onClick = {
                         val url = repository.trim()
-                        if (activity == null) {
+                        if (activity != null) {
+                            loading = true
+                            error = null
+                            analysis = null
+                            activity.startAnalysis(url) { result ->
+                                loading = false
+                                result.onSuccess { analysis = it }
+                                    .onFailure { error = it.message ?: "Неизвестная ошибка" }
+                            }
+                        } else {
                             error = "Не удалось получить Android Activity"
-                            return@Button
-                        }
-                        loading = true
-                        error = null
-                        analysis = null
-                        activity.startAnalysis(url) { result ->
-                            loading = false
-                            result.onSuccess { analysis = it }
-                                .onFailure { error = it.message ?: "Неизвестная ошибка" }
                         }
                     },
                     enabled = repository.isNotBlank() && !loading,
@@ -214,47 +204,25 @@ private fun ScreeningApp() {
                     shape = RoundedCornerShape(14.dp)
                 ) {
                     if (loading) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            strokeWidth = 2.dp
-                        )
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                         Spacer(Modifier.size(8.dp))
                     }
                     Text(if (loading) "Анализируем…" else "Начать анализ")
                 }
             }
-
-            if (analysis == null && !loading) {
-                item { HowItWorksCard() }
-            }
+            if (analysis == null && !loading) item { HowItWorksCard() }
 
             error?.let { message ->
                 item {
-                    Card(
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.errorContainer
-                        )
-                    ) {
-                        Text(
-                            message,
-                            modifier = Modifier.padding(16.dp),
-                            color = MaterialTheme.colorScheme.onErrorContainer
-                        )
+                    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+                        Text(message, modifier = Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onErrorContainer)
                     }
                 }
             }
 
             analysis?.let { result ->
                 item { SummaryCard(result) }
-
-                item {
-                    Text(
-                        "Подозрительные участки",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-
+                item { Text("Подозрительные участки", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold) }
                 if (result.findings.isEmpty()) {
                     item {
                         Card {
@@ -267,37 +235,19 @@ private fun ScreeningApp() {
                 } else {
                     items(result.findings) { finding -> FindingCard(finding) }
                 }
-
-                item {
-                    Text(
-                        "Вопросы для собеседования",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-
+                item { Text("Вопросы для собеседования", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold) }
                 if (result.questions.isEmpty()) {
-                    item {
-                        Card { Text("Вопросы пока не сформированы.", Modifier.padding(16.dp)) }
-                    }
+                    item { Card { Text("Вопросы пока не сформированы.", Modifier.padding(16.dp)) } }
                 } else {
                     items(result.questions) { question -> QuestionCard(question) }
                 }
-
                 item {
                     OutlinedButton(
-                        onClick = {
-                            analysis = null
-                            error = null
-                            loading = false
-                        },
+                        onClick = { analysis = null; error = null; loading = false },
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(14.dp)
-                    ) {
-                        Text("Проверить другой проект")
-                    }
+                    ) { Text("Проверить другой проект") }
                 }
-
                 item { Spacer(Modifier.height(12.dp)) }
             }
         }
@@ -314,10 +264,7 @@ private fun HeroCard() {
         Column(Modifier.padding(22.dp)) {
             Text("Проверка опыта разработчика", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
-            Text(
-                "Анализируйте публичные GitHub-проекты и получайте вопросы для технического скрининга.",
-                style = MaterialTheme.typography.bodyLarge
-            )
+            Text("Анализируйте публичные GitHub-проекты и получайте вопросы для технического скрининга.", style = MaterialTheme.typography.bodyLarge)
         }
     }
 }
@@ -334,10 +281,7 @@ private fun HowItWorksCard() {
             Spacer(Modifier.height(10.dp))
             HorizontalDivider()
             Spacer(Modifier.height(10.dp))
-            Text(
-                "Важно: результат не является доказательством использования нейросети. Окончательное решение принимает HR.",
-                style = MaterialTheme.typography.bodySmall
-            )
+            Text("Важно: результат не является доказательством использования нейросети. Окончательное решение принимает HR.", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -346,9 +290,7 @@ private fun HowItWorksCard() {
 private fun Step(number: String, title: String, description: String) {
     Row(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(
-            modifier = Modifier
-                .size(34.dp)
-                .background(MaterialTheme.colorScheme.secondaryContainer, RoundedCornerShape(10.dp)),
+            modifier = Modifier.size(34.dp).background(MaterialTheme.colorScheme.secondaryContainer, RoundedCornerShape(10.dp)),
             contentAlignment = Alignment.Center
         ) { Text(number, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold) }
         Spacer(Modifier.size(12.dp))
@@ -370,10 +312,7 @@ private fun SummaryCard(result: Analysis) {
                 Metric("Участков", result.findings.size.toString())
             }
             Spacer(Modifier.height(14.dp))
-            Text(
-                "Сигнал отражает наличие признаков, требующих дополнительной проверки.",
-                style = MaterialTheme.typography.bodySmall
-            )
+            Text("Сигнал отражает наличие признаков, требующих дополнительной проверки.", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
