@@ -1,20 +1,40 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import statistics
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
+
+from pydantic import BaseModel, Field
 
 try:
     from tree_sitter import Parser
     from tree_sitter_language_pack import get_language
-except ImportError:
+except ImportError:  # pragma: no cover
     Parser = None
     get_language = None
 
 
-@dataclass
+class Finding(BaseModel):
+    type: str
+    line_start: int = Field(ge=1)
+    line_end: int = Field(ge=1)
+    suspected_text: str
+    weight: float = Field(ge=0.0, le=1.0)
+    reason: str
+
+
+class FileAnalysisResult(BaseModel):
+    file_path: str
+    is_suspicious: bool
+    total_score: float = Field(ge=0.0, le=1.0)
+    findings: list[Finding]
+
+
+@dataclass(frozen=True)
 class Evidence:
     line: int
     text: str
@@ -45,12 +65,45 @@ class FileProfile:
     ast: dict[str, Any] | None = None
 
 
+AI_KEYWORDS = ("copilot", "chatgpt", "openai", "claude", "gemini")
+AI_KEYWORD_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:" + "|".join(map(re.escape, AI_KEYWORDS)) + r")(?![A-Za-z0-9_-])",
+    re.IGNORECASE,
+)
+
+GENERATION_PATTERNS = (
+    re.compile(r"\bgenerated\s+by\b", re.IGNORECASE),
+    re.compile(r"\bcreated\s+with\b", re.IGNORECASE),
+    re.compile(r"\bwritten\s+by\b", re.IGNORECASE),
+    re.compile(r"\bauthored\s+by\b", re.IGNORECASE),
+    re.compile(r"\bproduced\s+by\b", re.IGNORECASE),
+    re.compile(r"\bmade\s+with\b", re.IGNORECASE),
+    re.compile(r"\busing\s+(?:chatgpt|copilot|claude|gemini|openai)\b", re.IGNORECASE),
+)
+
+COMMENT_TYPE_RE = re.compile(r"comment", re.IGNORECASE)
+STRING_TYPE_RE = re.compile(r"string|string_literal|string_content", re.IGNORECASE)
+IDENTIFIER_TYPE_RE = re.compile(r"identifier", re.IGNORECASE)
+
+BRANCH_TYPES = {
+    "if_statement", "if_element", "for_statement", "for_element", "while_statement",
+    "switch_statement", "switch_expression", "conditional_expression", "catch_clause",
+    "case_clause", "when_entry", "match_arm", "try_statement", "except_clause",
+}
+FUNCTION_TYPES = {
+    "function_declaration", "method_declaration", "function_definition", "function_expression",
+    "method_definition", "function_item", "arrow_function", "lambda", "anonymous_function",
+    "function_literal", "constructor", "method_signature", "getter_signature", "setter_signature",
+}
+
+
 def language_for(path: str) -> str:
     ext = os.path.splitext(path.lower())[1]
     return {
-        ".kt": "kotlin", ".java": "java", ".py": "python", ".js": "javascript", ".ts": "typescript",
-        ".tsx": "typescript", ".jsx": "javascript", ".go": "go", ".rs": "rust", ".cpp": "cpp",
-        ".c": "c", ".h": "c", ".cs": "csharp", ".swift": "swift", ".dart": "dart",
+        ".kt": "kotlin", ".java": "java", ".py": "python", ".js": "javascript",
+        ".ts": "typescript", ".tsx": "typescript", ".jsx": "javascript", ".go": "go",
+        ".rs": "rust", ".cpp": "cpp", ".c": "c", ".h": "c", ".cs": "csharp",
+        ".swift": "swift", ".dart": "dart",
     }.get(ext, "unknown")
 
 
@@ -73,90 +126,163 @@ def function_pattern(language: str) -> re.Pattern[str]:
     return re.compile(r"^\s*(?:def|func|function)\s+[A-Za-z_]\w*\s*\(")
 
 
-def _node_depth(node: Any, limit: int = 2000) -> int:
-    max_depth = 0
-    stack = [(node, 0)]
-    visited = 0
-    while stack and visited < limit:
-        current, depth = stack.pop()
-        visited += 1
-        max_depth = max(max_depth, depth)
-        stack.extend((child, depth + 1) for child in reversed(current.children))
-    return max_depth
+def _node_text(node: Any, source: bytes) -> str:
+    return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
 
 
-def _descendant_count(node: Any, wanted: set[str], limit: int = 4000) -> int:
-    count = 0
-    stack = [node]
-    visited = 0
-    while stack and visited < limit:
-        current = stack.pop()
-        visited += 1
-        if current.type in wanted:
-            count += 1
-        stack.extend(reversed(current.children))
-    return count
+def _is_ignored_provenance_context(node: Any) -> bool:
+    node_type = str(getattr(node, "type", "")).lower()
+    return bool(STRING_TYPE_RE.search(node_type) or IDENTIFIER_TYPE_RE.search(node_type))
 
 
-def dart_ast_metrics(code: str) -> dict[str, Any] | None:
-    """Extract function-local Dart structure; normal repeated Flutter widgets are ignored."""
-    if Parser is None or get_language is None:
-        return None
-    try:
-        language = get_language("dart")
-        parser = Parser(language)
-        tree = parser.parse(code.encode("utf-8"))
-        root = tree.root_node
-    except Exception:
-        return None
+def _is_generation_string(text: str) -> bool:
+    return any(pattern.search(text) for pattern in GENERATION_PATTERNS)
 
-    source = code.encode("utf-8")
-    function_types = {
-        "function_declaration", "method_declaration", "function_expression",
-        "getter_signature", "setter_signature", "method_signature",
-    }
-    branch_types = {
-        "if_statement", "if_element", "for_statement", "for_element",
-        "while_statement", "switch_statement", "switch_expression",
-        "conditional_expression", "catch_clause", "case_clause",
-    }
 
-    functions: list[dict[str, int]] = []
-    widget_constructors = 0
-    parse_errors = 0
+def _walk(root: Any) -> Iterable[Any]:
+    """Iterative traversal: no Python recursion on deeply nested source trees."""
     stack = [root]
     while stack:
         node = stack.pop()
+        yield node
+        stack.extend(reversed(getattr(node, "children", ())))
+
+
+def provenance_findings(root: Any, source: bytes) -> list[Finding]:
+    """Apply the provenance filter to AST nodes.
+
+    An AI product name is not evidence by itself. In particular, normal API data
+    such as ``"github/copilot"`` and identifiers such as ``copilotClient`` are
+    ignored. Comments are strong evidence; string literals are accepted only when
+    the same literal explicitly describes generation/authorship.
+    """
+    findings: list[Finding] = []
+    for node in _walk(root):
+        node_type = str(getattr(node, "type", ""))
+        node_type_lower = node_type.lower()
+        text = _node_text(node, source)
+
+        # Do not inspect arbitrary parent nodes. Their text includes descendants
+        # and would turn a legitimate nested API reference into a false positive.
+        is_comment = bool(COMMENT_TYPE_RE.search(node_type_lower))
+        is_string = bool(STRING_TYPE_RE.search(node_type_lower))
+        is_identifier = bool(IDENTIFIER_TYPE_RE.search(node_type_lower))
+        if not (is_comment or is_string or is_identifier):
+            continue
+        if not AI_KEYWORD_RE.search(text):
+            continue
+
+        if is_comment:
+            findings.append(Finding(
+                type="provenance_comment",
+                line_start=node.start_point[0] + 1,
+                line_end=node.end_point[0] + 1,
+                suspected_text=text.strip()[:500],
+                weight=0.9,
+                reason="AI-инструмент упомянут в комментарии; это сильный provenance-сигнал, который нужно проверить вручную.",
+            ))
+            continue
+
+        if is_identifier:
+            # Explicit requirement: variable/function/API identifiers are ignored.
+            continue
+
+        if is_string:
+            if _is_generation_string(text):
+                findings.append(Finding(
+                    type="provenance_generation_string",
+                    line_start=node.start_point[0] + 1,
+                    line_end=node.end_point[0] + 1,
+                    suspected_text=text.strip()[:500],
+                    weight=0.9,
+                    reason="Строковый литерал содержит AI-бренд вместе с явным описанием генерации или авторства.",
+                ))
+            # Otherwise a string literal is normal application data and scores zero.
+
+    unique: dict[tuple[str, int, int, str], Finding] = {}
+    for finding in findings:
+        unique[(finding.type, finding.line_start, finding.line_end, finding.suspected_text)] = finding
+    return list(unique.values())
+
+
+def _function_metrics(node: Any) -> dict[str, int]:
+    branch_count = 0
+    max_depth = 0
+    parse_errors = 0
+    stack: list[tuple[Any, int]] = [(node, 0)]
+    while stack:
+        current, depth = stack.pop()
+        max_depth = max(max_depth, depth)
+        if current.type == "ERROR":
+            parse_errors += 1
+        if current.type in BRANCH_TYPES:
+            branch_count += 1
+        stack.extend((child, depth + 1) for child in reversed(current.children))
+    return {"branch_count": branch_count, "max_depth": max_depth, "parse_errors": parse_errors}
+
+
+def _structure_signature(node: Any) -> str:
+    """Hash AST node types while ignoring names, literals and comments."""
+    ignored = {
+        "identifier", "type_identifier", "property_identifier", "field_identifier",
+        "string", "string_literal", "string_content", "integer_literal", "float_literal",
+        "comment", "line_comment", "block_comment",
+    }
+    types = [current.type for current in _walk(node) if current.type not in ignored]
+    return hashlib.sha1("|".join(types).encode("utf-8"), usedforsecurity=False).hexdigest()
+
+
+def _ast_metrics(code: str, language_name: str) -> dict[str, Any] | None:
+    if Parser is None or get_language is None:
+        return None
+    try:
+        language = get_language(language_name)
+        parser = Parser(language)
+        tree = parser.parse(code.encode("utf-8"))
+    except Exception:
+        return None
+
+    root = tree.root_node
+    functions: list[dict[str, Any]] = []
+    parse_errors = 0
+    widget_constructors = 0
+    source = code.encode("utf-8")
+
+    for node in _walk(root):
         if node.type == "ERROR":
             parse_errors += 1
-        if node.type in function_types:
-            start_line = node.start_point[0] + 1
-            end_line = node.end_point[0] + 1
+        if node.type in FUNCTION_TYPES or "function_declaration" in node.type:
+            metrics = _function_metrics(node)
             functions.append({
-                "line": start_line,
-                "end_line": end_line,
-                "length": max(1, end_line - start_line + 1),
-                "depth": _node_depth(node),
-                "branches": _descendant_count(node, branch_types),
+                "line": node.start_point[0] + 1,
+                "end_line": node.end_point[0] + 1,
+                "length": max(1, node.end_point[0] - node.start_point[0] + 1),
+                "branches": metrics["branch_count"],
+                "depth": metrics["max_depth"],
+                "signature": _structure_signature(node),
             })
-        if node.type == "constructor_invocation":
-            try:
-                text = source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
-                name = text.split("(", 1)[0].strip().split(".")[-1]
-                if name and name[0].isupper():
-                    widget_constructors += 1
-            except Exception:
-                pass
-        stack.extend(reversed(node.children))
+        if language_name == "dart" and node.type == "constructor_invocation":
+            text = _node_text(node, source)
+            name = text.split("(", 1)[0].strip().split(".")[-1]
+            if name and name[0].isupper():
+                widget_constructors += 1
+
+    signatures: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for fn in functions:
+        if fn["length"] >= 8:
+            signatures[fn["signature"]].append(fn)
 
     return {
         "functions": functions,
-        "long_functions": [f for f in functions if f["length"] >= 45],
-        "branch_count": sum(f["branches"] for f in functions),
-        "max_depth": max((f["depth"] for f in functions), default=0),
+        "long_functions": [fn for fn in functions if fn["length"] >= 45],
+        "repeated_templates": [group for group in signatures.values() if len(group) >= 3],
         "widget_constructors": widget_constructors,
         "parse_errors": parse_errors,
     }
+
+
+def dart_ast_metrics(code: str) -> dict[str, Any] | None:
+    return _ast_metrics(code, "dart")
 
 
 def build_profile(path: str, code: str) -> FileProfile:
@@ -171,7 +297,7 @@ def build_profile(path: str, code: str) -> FileProfile:
         1 for line in comments
         if re.search(r"\b(this|the|function|method|class|widget|component|returns?|handles?|purpose|responsible for)\b", line, re.I)
     )
-    ast = dart_ast_metrics(code) if language == "dart" else None
+    ast = _ast_metrics(code, language) if language != "unknown" else None
     return FileProfile(
         path=path,
         code=code,
@@ -188,20 +314,18 @@ def build_profile(path: str, code: str) -> FileProfile:
 
 
 def _normalise_function_body(lines: list[str]) -> str:
-    """Remove identifiers/literals so only unusually identical function skeletons remain."""
     text = "\n".join(lines)
     text = re.sub(r"//.*", "", text)
     text = re.sub(r"(['\"])(?:\\.|(?!\1).)*\1", "STR", text)
     text = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", "ID", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _function_blocks(profile: FileProfile) -> list[tuple[int, int, str]]:
     if not profile.ast:
         return []
-    blocks = []
     lines = profile.code.splitlines()
+    blocks = []
     for fn in profile.ast["functions"]:
         start = max(1, fn["line"])
         end = min(len(lines), fn["end_line"])
@@ -210,121 +334,91 @@ def _function_blocks(profile: FileProfile) -> list[tuple[int, int, str]]:
     return blocks
 
 
-def evidence_for_code(profile: FileProfile, repo_profiles: list[FileProfile]) -> FindingData | None:
-    """Return only multi-signal evidence that is worth discussing with a candidate.
+def analyze_file(file_content: str, language: str) -> FileAnalysisResult:
+    """Parse and score one source file. Score is a review signal, not AI probability."""
+    normalized_language = language.lower().lstrip(".")
+    try:
+        if Parser is None or get_language is None:
+            return FileAnalysisResult(file_path="analysis", is_suspicious=False, total_score=0.0, findings=[])
+        language_obj = get_language(normalized_language)
+        parser = Parser(language_obj)
+        source = file_content.encode("utf-8")
+        tree = parser.parse(source)
+    except Exception:
+        return FileAnalysisResult(file_path="analysis", is_suspicious=False, total_score=0.0, findings=[])
 
-    Repeated InputDecoration/Container/Text/Row/Column and similar UI constructs are
-    explicitly not treated as AI evidence. No score here is a calibrated probability.
-    """
-    lines = profile.code.splitlines()
-    non_empty = [(i + 1, line) for i, line in enumerate(lines) if line.strip()]
-    score = 0
-    reasons: list[str] = []
-    evidence: list[Evidence] = []
+    findings = provenance_findings(tree.root_node, source)
+    ast = _ast_metrics(file_content, normalized_language)
 
-    def add(line_no: int, text: str, points: int, reason: str) -> None:
-        nonlocal score
-        score += points
-        evidence.append(Evidence(line=line_no, text=text.strip()[:240], reason=reason))
-        if reason not in reasons:
-            reasons.append(reason)
-
-    # Explicit provenance is strong, but still displayed as evidence rather than proof.
-    ai_marker = re.compile(r"generated\s+by|chatgpt|copilot|github\s+copilot|ai[- ]generated|openai|gemini|claude", re.I)
-    for line_no, line in non_empty:
-        if ai_marker.search(line):
-            add(line_no, line, 70, "явный маркер AI-инструмента или сгенерированного кода")
-
-    # Template markers are intentionally weak.
-    template_marker = re.compile(r"TODO|FIXME|PLACEHOLDER|IMPLEMENT\s+HERE|YOUR\s+CODE|ADD\s+YOUR", re.I)
-    for line_no, line in non_empty:
-        if template_marker.search(line):
-            add(line_no, line, 2, "шаблонный маркер незавершённого участка")
-
-    # Polished explanatory comments: weak on their own, stronger when repeated with other signals.
-    generic_comment = re.compile(
-        r"^\s*(?://|#|/\*|\*)\s*(this (function|method|class|widget|component)|the (function|method|purpose)|returns?\s+the|handles?\s+the|responsible for)",
-        re.I,
-    )
-    generic_hits = []
-    for line_no, line in non_empty:
-        if generic_comment.search(line):
-            generic_hits.append((line_no, line))
-    if generic_hits:
-        for line_no, line in generic_hits[:4]:
-            add(line_no, line, 2, "избыточный шаблонный комментарий")
-        if len(generic_hits) >= 4:
-            score += 3
-            reasons.append("много однотипных поясняющих комментариев")
-
-    ast = profile.ast
+    lines = file_content.splitlines()
     if ast:
-        # Function-local, not file-global, complexity avoids false positives from large Flutter trees.
-        suspicious_functions = [
+        suspicious = [
             fn for fn in ast["functions"]
             if fn["length"] >= 45 and fn["depth"] >= 8 and fn["branches"] >= 8
         ]
-        if suspicious_functions:
-            fn = max(suspicious_functions, key=lambda x: (x["branches"], x["length"], x["depth"]))
-            line = lines[fn["line"] - 1] if fn["line"] <= len(lines) else ""
-            add(fn["line"], line, 6, "AST: одна функция одновременно длинная, глубоко вложенная и содержит много ветвлений")
+        for fn in suspicious[:4]:
+            start = fn["line"]
+            end = min(fn["end_line"], start + 2)
+            findings.append(Finding(
+                type="structural_complexity",
+                line_start=start,
+                line_end=end,
+                suspected_text="\n".join(lines[start - 1:end]).strip()[:500],
+                weight=0.28,
+                reason="AST: длинная функция одновременно имеет глубокую вложенность и много ветвлений.",
+            ))
 
-        # A huge widget tree is normal in Flutter, so it is only a tiny contextual signal.
-        if ast["widget_constructors"] >= 35 and ast["long_functions"] and profile.comment_lines >= 6:
-            fn = max(ast["long_functions"], key=lambda x: x["length"])
-            line = lines[fn["line"] - 1] if fn["line"] <= len(lines) else ""
-            add(fn["line"], line, 2, "AST: большой widget tree сочетается с нетипично подробными комментариями")
+        # Normal UI repetition is deliberately excluded from this signal.
+        for group in ast["repeated_templates"][:3]:
+            if len(group) < 3:
+                continue
+            representative = min(group, key=lambda fn: fn["line"])
+            start = representative["line"]
+            body = "\n".join(lines[start - 1:representative["end_line"]])
+            if re.search(r"\b(InputDecoration|Container|Text|Row|Column|Padding|SizedBox|BorderRadius)\b", body):
+                continue
+            findings.append(Finding(
+                type="repeated_function_template",
+                line_start=start,
+                line_end=representative["end_line"],
+                suspected_text=body.strip()[:500],
+                weight=0.12,
+                reason="AST: несколько функций имеют одинаковый структурный шаблон после исключения имён и литералов; это слабый сигнал, а не доказательство AI.",
+            ))
 
-    # Repeated function skeletons are considered only outside obvious UI constructors.
-    blocks = _function_blocks(profile)
-    skeletons: dict[str, list[int]] = {}
-    for start, end, skeleton in blocks:
-        if len(skeleton) < 80:
-            continue
-        if re.search(r"InputDecoration|Container|Text|Row|Column|Padding|SizedBox|BorderRadius", skeleton):
-            continue
-        skeletons.setdefault(skeleton, []).append(start)
-    repeated = [starts for starts in skeletons.values() if len(starts) >= 2]
-    if repeated:
-        starts = repeated[0][:3]
-        for line_no in starts:
-            add(line_no, lines[line_no - 1], 2, "одинаковый нетипичный шаблон нескольких функций")
+    # Deduplicate exact findings and calculate a bounded score.
+    unique: dict[tuple[str, int, int, str], Finding] = {}
+    for finding in findings:
+        unique[(finding.type, finding.line_start, finding.line_end, finding.suspected_text)] = finding
+    final_findings = sorted(unique.values(), key=lambda item: (-item.weight, item.line_start))[:12]
 
-    # Repository-relative style outliers are deliberately tiny signals.
-    same_language = [p for p in repo_profiles if p.language == profile.language and p.non_empty_lines >= 20]
-    if len(same_language) >= 4:
-        median_len = statistics.median(p.avg_line_length for p in same_language)
-        median_comments = statistics.median(p.comment_lines / max(1, p.non_empty_lines) for p in same_language)
-        comment_ratio = profile.comment_lines / max(1, profile.non_empty_lines)
-        if median_len > 0 and profile.avg_line_length > median_len * 1.8:
-            longest = sorted(non_empty, key=lambda x: len(x[1]), reverse=True)[:2]
-            for line_no, line in longest:
-                add(line_no, line, 1, "строка заметно выбивается по стилю от файлов того же языка")
-        if median_comments == 0 and comment_ratio > 0.20:
-            score += 1
-            reasons.append("необычно высокая доля поясняющих комментариев")
+    total_score = 0.0
+    seen_types: set[str] = set()
+    for finding in final_findings:
+        multiplier = 1.0 if finding.type not in seen_types else 0.35
+        total_score += finding.weight * multiplier
+        seen_types.add(finding.type)
+    total_score = min(1.0, round(total_score, 3))
 
-    # Never flag a file merely because it is large, repetitive, or full of UI widgets.
-    independent = len(set(reasons))
-    strong = any(item.reason.startswith("явный маркер") for item in evidence)
-    if not strong and independent < 2:
-        return None
-
-    score = min(score, 95)
-    unique: dict[int, Evidence] = {}
-    for item in evidence:
-        if item.line not in unique or item.reason.startswith("явный маркер"):
-            unique[item.line] = item
-    final_evidence = list(unique.values())[:8]
-    if not final_evidence:
-        return None
-
-    line_numbers = sorted({item.line for item in final_evidence})
-    line_range = str(line_numbers[0]) if len(line_numbers) == 1 else ", ".join(map(str, line_numbers))
-    return FindingData(
-        file=profile.path,
-        lines=line_range,
-        score=score,
-        reason="; ".join(reasons),
-        evidence=final_evidence,
+    return FileAnalysisResult(
+        file_path="analysis",
+        is_suspicious=bool(final_findings),
+        total_score=total_score,
+        findings=final_findings,
     )
+
+
+def evidence_for_code(profile: FileProfile, repo_profiles: list[FileProfile]) -> FindingData | None:
+    """Backward-compatible adapter for the existing FastAPI response contract."""
+    result = analyze_file(profile.code, profile.language)
+    if not result.findings:
+        return None
+    evidence = [
+        Evidence(line=item.line_start, text=item.suspected_text.replace("\n", " ")[:240], reason=item.reason)
+        for item in result.findings[:8]
+    ]
+    line_numbers = sorted({item.line for item in evidence})
+    line_range = str(line_numbers[0]) if len(line_numbers) == 1 else ", ".join(map(str, line_numbers))
+    score = round(result.total_score * 100)
+    reason = "; ".join(dict.fromkeys(item.reason for item in result.findings))
+    return FindingData(profile.path, line_range, score, reason, evidence)
