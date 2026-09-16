@@ -6,6 +6,7 @@
         android:allowBackup="true"
         android:label="AI Code Screening"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
         <activity
             android:name=".MainActivity"
