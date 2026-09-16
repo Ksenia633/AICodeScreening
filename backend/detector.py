@@ -84,7 +84,6 @@ GENERATION_PATTERNS = (
 COMMENT_TYPE_RE = re.compile(r"comment", re.IGNORECASE)
 STRING_TYPE_RE = re.compile(r"string|string_literal|string_content", re.IGNORECASE)
 IDENTIFIER_TYPE_RE = re.compile(r"identifier", re.IGNORECASE)
-
 BRANCH_TYPES = {
     "if_statement", "if_element", "for_statement", "for_element", "while_statement",
     "switch_statement", "switch_expression", "conditional_expression", "catch_clause",
@@ -130,15 +129,6 @@ def _node_text(node: Any, source: bytes) -> str:
     return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
 
 
-def _is_ignored_provenance_context(node: Any) -> bool:
-    node_type = str(getattr(node, "type", "")).lower()
-    return bool(STRING_TYPE_RE.search(node_type) or IDENTIFIER_TYPE_RE.search(node_type))
-
-
-def _is_generation_string(text: str) -> bool:
-    return any(pattern.search(text) for pattern in GENERATION_PATTERNS)
-
-
 def _walk(root: Any) -> Iterable[Any]:
     """Iterative traversal: no Python recursion on deeply nested source trees."""
     stack = [root]
@@ -148,28 +138,39 @@ def _walk(root: Any) -> Iterable[Any]:
         stack.extend(reversed(getattr(node, "children", ())))
 
 
-def provenance_findings(root: Any, source: bytes) -> list[Finding]:
-    """Apply the provenance filter to AST nodes.
+def _is_generation_string_node(node_type: str) -> bool:
+    normalized = node_type.lower()
+    return normalized == "string" or "string_literal" in normalized
 
-    An AI product name is not evidence by itself. In particular, normal API data
-    such as ``"github/copilot"`` and identifiers such as ``copilotClient`` are
-    ignored. Comments are strong evidence; string literals are accepted only when
-    the same literal explicitly describes generation/authorship.
-    """
+
+def _is_ignored_provenance_context(node: Any) -> bool:
+    node_type = str(getattr(node, "type", "")).lower()
+    return bool(IDENTIFIER_TYPE_RE.search(node_type) or "string_content" in node_type)
+
+
+def _is_generation_string(text: str) -> bool:
+    return any(pattern.search(text) for pattern in GENERATION_PATTERNS)
+
+
+def provenance_findings(root: Any, source: bytes) -> list[Finding]:
+    """Apply the context filter before adding any provenance score."""
     findings: list[Finding] = []
     for node in _walk(root):
         node_type = str(getattr(node, "type", ""))
         node_type_lower = node_type.lower()
         text = _node_text(node, source)
-
-        # Do not inspect arbitrary parent nodes. Their text includes descendants
-        # and would turn a legitimate nested API reference into a false positive.
-        is_comment = bool(COMMENT_TYPE_RE.search(node_type_lower))
-        is_string = bool(STRING_TYPE_RE.search(node_type_lower))
-        is_identifier = bool(IDENTIFIER_TYPE_RE.search(node_type_lower))
-        if not (is_comment or is_string or is_identifier):
-            continue
         if not AI_KEYWORD_RE.search(text):
+            continue
+
+        is_comment = bool(COMMENT_TYPE_RE.search(node_type_lower))
+        is_string_literal = _is_generation_string_node(node_type)
+        is_string_content = "string_content" in node_type_lower
+        is_identifier = bool(IDENTIFIER_TYPE_RE.search(node_type_lower))
+
+        # Critical false-positive rule: normal strings, string content and
+        # identifiers are not provenance evidence unless the string-literal
+        # exception below is satisfied.
+        if is_identifier or is_string_content:
             continue
 
         if is_comment:
@@ -183,21 +184,15 @@ def provenance_findings(root: Any, source: bytes) -> list[Finding]:
             ))
             continue
 
-        if is_identifier:
-            # Explicit requirement: variable/function/API identifiers are ignored.
-            continue
-
-        if is_string:
-            if _is_generation_string(text):
-                findings.append(Finding(
-                    type="provenance_generation_string",
-                    line_start=node.start_point[0] + 1,
-                    line_end=node.end_point[0] + 1,
-                    suspected_text=text.strip()[:500],
-                    weight=0.9,
-                    reason="Строковый литерал содержит AI-бренд вместе с явным описанием генерации или авторства.",
-                ))
-            # Otherwise a string literal is normal application data and scores zero.
+        if is_string_literal and _is_generation_string(text):
+            findings.append(Finding(
+                type="provenance_generation_string",
+                line_start=node.start_point[0] + 1,
+                line_end=node.end_point[0] + 1,
+                suspected_text=text.strip()[:500],
+                weight=0.9,
+                reason="Строковый литерал содержит AI-бренд вместе с явным описанием генерации или авторства.",
+            ))
 
     unique: dict[tuple[str, int, int, str], Finding] = {}
     for finding in findings:
@@ -222,7 +217,7 @@ def _function_metrics(node: Any) -> dict[str, int]:
 
 
 def _structure_signature(node: Any) -> str:
-    """Hash AST node types while ignoring names, literals and comments."""
+    """Hash AST structure while ignoring identifiers, literals and comments."""
     ignored = {
         "identifier", "type_identifier", "property_identifier", "field_identifier",
         "string", "string_literal", "string_content", "integer_literal", "float_literal",
@@ -238,7 +233,8 @@ def _ast_metrics(code: str, language_name: str) -> dict[str, Any] | None:
     try:
         language = get_language(language_name)
         parser = Parser(language)
-        tree = parser.parse(code.encode("utf-8"))
+        source = code.encode("utf-8")
+        tree = parser.parse(source)
     except Exception:
         return None
 
@@ -246,7 +242,6 @@ def _ast_metrics(code: str, language_name: str) -> dict[str, Any] | None:
     functions: list[dict[str, Any]] = []
     parse_errors = 0
     widget_constructors = 0
-    source = code.encode("utf-8")
 
     for node in _walk(root):
         if node.type == "ERROR":
@@ -268,9 +263,9 @@ def _ast_metrics(code: str, language_name: str) -> dict[str, Any] | None:
                 widget_constructors += 1
 
     signatures: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for fn in functions:
-        if fn["length"] >= 8:
-            signatures[fn["signature"]].append(fn)
+    for function in functions:
+        if function["length"] >= 8:
+            signatures[function["signature"]].append(function)
 
     return {
         "functions": functions,
@@ -335,7 +330,7 @@ def _function_blocks(profile: FileProfile) -> list[tuple[int, int, str]]:
 
 
 def analyze_file(file_content: str, language: str) -> FileAnalysisResult:
-    """Parse and score one source file. Score is a review signal, not AI probability."""
+    """Parse and score one file; total_score is a review signal, not AI probability."""
     normalized_language = language.lower().lstrip(".")
     try:
         if Parser is None or get_language is None:
@@ -349,8 +344,8 @@ def analyze_file(file_content: str, language: str) -> FileAnalysisResult:
 
     findings = provenance_findings(tree.root_node, source)
     ast = _ast_metrics(file_content, normalized_language)
-
     lines = file_content.splitlines()
+
     if ast:
         suspicious = [
             fn for fn in ast["functions"]
@@ -368,10 +363,9 @@ def analyze_file(file_content: str, language: str) -> FileAnalysisResult:
                 reason="AST: длинная функция одновременно имеет глубокую вложенность и много ветвлений.",
             ))
 
-        # Normal UI repetition is deliberately excluded from this signal.
+        # Repetition is structural evidence only. Common Flutter UI constructors
+        # are explicitly excluded because repetition there is normal.
         for group in ast["repeated_templates"][:3]:
-            if len(group) < 3:
-                continue
             representative = min(group, key=lambda fn: fn["line"])
             start = representative["line"]
             body = "\n".join(lines[start - 1:representative["end_line"]])
@@ -386,12 +380,12 @@ def analyze_file(file_content: str, language: str) -> FileAnalysisResult:
                 reason="AST: несколько функций имеют одинаковый структурный шаблон после исключения имён и литералов; это слабый сигнал, а не доказательство AI.",
             ))
 
-    # Deduplicate exact findings and calculate a bounded score.
     unique: dict[tuple[str, int, int, str], Finding] = {}
     for finding in findings:
         unique[(finding.type, finding.line_start, finding.line_end, finding.suspected_text)] = finding
     final_findings = sorted(unique.values(), key=lambda item: (-item.weight, item.line_start))[:12]
 
+    # Diminishing returns prevent many similar findings from dominating the score.
     total_score = 0.0
     seen_types: set[str] = set()
     for finding in final_findings:
