@@ -37,6 +37,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
@@ -60,8 +61,8 @@ private data class Analysis(
     val findings: List<Finding>,
     val questions: List<String>
 ) {
-    val screeningScore: Int
-        get() = if (findings.isEmpty()) 100 else (100 - findings.map { it.score }.average().toInt()).coerceIn(0, 100)
+    val suspicionScore: Int
+        get() = if (findings.isEmpty()) 0 else findings.map { it.score }.average().toInt().coerceIn(0, 100)
 }
 
 class MainActivity : ComponentActivity() {
@@ -76,7 +77,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun analyze(repositoryUrl: String, onResult: (Result<Analysis>) -> Unit) {
+    fun startAnalysis(repositoryUrl: String, onResult: (Result<Analysis>) -> Unit) {
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
@@ -142,6 +143,7 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun ScreeningApp() {
+    val activity = LocalContext.current as? MainActivity
     var repository by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -193,10 +195,19 @@ private fun ScreeningApp() {
             item {
                 Button(
                     onClick = {
+                        val url = repository.trim()
+                        if (activity == null) {
+                            error = "Не удалось получить Android Activity"
+                            return@Button
+                        }
                         loading = true
                         error = null
                         analysis = null
-                        // The actual request is started by the Activity helper below.
+                        activity.startAnalysis(url) { result ->
+                            loading = false
+                            result.onSuccess { analysis = it }
+                                .onFailure { error = it.message ?: "Неизвестная ошибка" }
+                        }
                     },
                     enabled = repository.isNotBlank() && !loading,
                     modifier = Modifier.fillMaxWidth(),
@@ -265,7 +276,13 @@ private fun ScreeningApp() {
                     )
                 }
 
-                items(result.questions) { question -> QuestionCard(question) }
+                if (result.questions.isEmpty()) {
+                    item {
+                        Card { Text("Вопросы пока не сформированы.", Modifier.padding(16.dp)) }
+                    }
+                } else {
+                    items(result.questions) { question -> QuestionCard(question) }
+                }
 
                 item {
                     OutlinedButton(
@@ -348,10 +365,15 @@ private fun SummaryCard(result: Analysis) {
             Text(result.repository, style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(18.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Metric("Screening", "${result.screeningScore}/100")
+                Metric("Сигнал", "${result.suspicionScore}%")
                 Metric("Файлов", result.filesAnalyzed.toString())
                 Metric("Участков", result.findings.size.toString())
             }
+            Spacer(Modifier.height(14.dp))
+            Text(
+                "Сигнал отражает наличие признаков, требующих дополнительной проверки.",
+                style = MaterialTheme.typography.bodySmall
+            )
         }
     }
 }
